@@ -9,250 +9,286 @@ import torch.nn.functional as F
 _MIN_COVERAGE_RATIO = 0.80
 
 
-class RETFoundDINO(nn.Module):
+class _FeatureBackbone(nn.Module):
+    """Normalize model-specific encoders to a [batch, feature_dim] tensor."""
+
+    def __init__(self, encoder: nn.Module, feature_dim: int) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.num_features = feature_dim
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        output = self.encoder(images)
+        if isinstance(output, dict):
+            for key in ("x_norm_clstoken", "last_hidden_state", "pooler_output"):
+                if key in output:
+                    output = output[key]
+                    break
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        if output.ndim == 3:
+            output = output[:, 0]
+        if output.ndim > 2:
+            output = output.flatten(1)
+        return output
+
+
+class FoundationClassifier(nn.Module):
+    """Common classifier/projection heads for the supported image encoders.
+
+    Every model returns logits [B, num_classes], a normalized projection
+    [B, projection_dim], or raw encoder features via the same ``mode`` API as
+    :class:`RETFoundDINO`. ``backbone`` is the actual image encoder, so callers
+    can use its transformer blocks for partial fine-tuning.
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        embed_dim: int,
+        num_classes: int = 39,
+        projection_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.embed_dim = embed_dim
+        self.num_classes = num_classes
+        self.classification_head = nn.Linear(embed_dim, num_classes)
+        self.projection_head = nn.Sequential(
+            nn.Linear(embed_dim, 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
+            nn.Linear(512, projection_dim),
+        )
+        self.temperature = nn.Parameter(torch.ones(1), requires_grad=False)
+
+    def forward(self, x: torch.Tensor, mode: str = "classification", use_temperature: bool = True):
+        features = self.backbone(x)
+        if mode == "features":
+            return features
+        if mode in ("classification", "both"):
+            logits = self.classification_head(features)
+            if use_temperature:
+                logits = logits / self.temperature
+        if mode == "classification":
+            return logits
+        if mode == "projection":
+            return F.normalize(self.projection_head(features), dim=1)
+        if mode == "both":
+            return logits, F.normalize(self.projection_head(features), dim=1)
+        raise ValueError("mode must be 'classification', 'projection', 'features', or 'both'")
+
+    def unfreeze_last_n_blocks(self, num_layers: int) -> None:
+        """Freeze the encoder, then unfreeze its final transformer blocks and heads."""
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+        for head in (self.classification_head, self.projection_head):
+            for parameter in head.parameters():
+                parameter.requires_grad = True
+        encoder = getattr(self.backbone, "encoder", self.backbone)
+        blocks = getattr(encoder, "blocks", None)
+        if blocks is None:
+            transformer = getattr(encoder, "transformer", None)
+            blocks = getattr(transformer, "resblocks", None)
+        if blocks is None:
+            raise AttributeError("This encoder exposes no transformer blocks for partial unfreezing")
+        count = min(max(int(num_layers), 0), len(blocks))
+        for block in list(blocks)[-count:] if count else []:
+            for parameter in block.parameters():
+                parameter.requires_grad = True
+        for name in ("norm", "ln_post"):
+            norm = getattr(encoder, name, None)
+            if norm is not None:
+                for parameter in norm.parameters():
+                    parameter.requires_grad = True
+
+    def count_parameters(self) -> dict[str, float]:
+        """Return trainable and total parameter counts per model component."""
+        def count(module: nn.Module) -> tuple[int, int]:
+            total = sum(parameter.numel() for parameter in module.parameters())
+            trainable = sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+            return total, trainable
+
+        backbone_total, backbone_trainable = count(self.backbone)
+        classifier_total, _ = count(self.classification_head)
+        projection_total, _ = count(self.projection_head)
+        model_total, model_trainable = count(self)
+        return {
+            "backbone_total_M": backbone_total / 1e6,
+            "backbone_trainable_M": backbone_trainable / 1e6,
+            "classification_head_total_M": classifier_total / 1e6,
+            "projection_head_total_M": projection_total / 1e6,
+            "model_total_M": model_total / 1e6,
+            "model_trainable_M": model_trainable / 1e6,
+        }
+
+
+def _load_encoder_checkpoint(encoder: nn.Module, path: str, min_coverage: float = 0.8) -> None:
+    """Load a local encoder checkpoint, accepting common wrapper prefixes."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    raw = torch.load(path, map_location="cpu", weights_only=False)
+    for key in ("state_dict", "model", "teacher", "model_state_dict"):
+        if isinstance(raw, dict) and key in raw and isinstance(raw[key], dict):
+            raw = raw[key]
+            break
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Checkpoint {path} does not contain a state dict")
+    target = encoder.state_dict()
+    matched = {}
+    for key, value in raw.items():
+        if not torch.is_tensor(value):
+            continue
+        candidates = [key]
+        current = key
+        for _ in range(4):
+            for prefix in ("module.", "model.", "backbone.", "encoder.", "visual."):
+                if current.startswith(prefix):
+                    current = current[len(prefix):]
+                    candidates.append(current)
+        for candidate in candidates:
+            if candidate in target and target[candidate].shape == value.shape:
+                matched[candidate] = value
+                break
+    coverage = len(matched) / max(len(target), 1)
+    if coverage < min_coverage:
+        raise RuntimeError(f"Only {coverage:.1%} of encoder keys matched {path}; check architecture/checkpoint pairing")
+    encoder.load_state_dict(matched, strict=False)
+
+
+class RETFoundMAE(FoundationClassifier):
+    """RETFound-MAE (ViT-L/16, 1024 features) with task-specific heads."""
+    def __init__(self, num_classes: int = 39, projection_dim: int = 128,
+                 checkpoint_path: str | None = "weights/RETFound_mae_shanghai.pth",
+                 model_name: str = "vit_large_patch16_224", image_size: int = 224):
+        encoder = timm.create_model(model_name, pretrained=False, num_classes=0, img_size=image_size)
+        if checkpoint_path:
+            _load_encoder_checkpoint(encoder, checkpoint_path)
+        super().__init__(encoder, int(encoder.num_features), num_classes, projection_dim)
+        self.image_size = image_size
+
+
+class DINOv2Classifier(FoundationClassifier):
+    """Vanilla Meta DINOv2 encoder with a linear classifier and projection head."""
+    def __init__(self, num_classes: int = 39, projection_dim: int = 128,
+                 model_name: str = "dinov2_vitl14", pretrained: bool = True,
+                 checkpoint_path: str | None = None):
+        encoder = torch.hub.load("facebookresearch/dinov2", model_name, pretrained=pretrained)
+        if checkpoint_path:
+            _load_encoder_checkpoint(encoder, checkpoint_path)
+        feature_dim = int(getattr(encoder, "embed_dim", getattr(encoder, "num_features", 0)))
+        if not feature_dim:
+            raise RuntimeError("Could not determine DINOv2 embedding dimension")
+        # Official DINOv2 hub forward returns the class-token feature vector.
+        super().__init__(_FeatureBackbone(encoder, feature_dim), feature_dim, num_classes, projection_dim)
+
+
+class EyeCLIPClassifier(FoundationClassifier):
+    """EyeCLIP ViT-B/32 visual encoder; requires the official OpenAI CLIP package."""
+    def __init__(self, num_classes: int = 39, projection_dim: int = 128,
+                 checkpoint_path: str = "weights/eyeclip_visual.pt", image_size: int = 224):
+        try:
+            import clip
+        except ImportError as exc:
+            raise ImportError("EyeCLIP requires the official OpenAI CLIP package (pip install git+https://github.com/openai/CLIP.git)") from exc
+        clip_model, _ = clip.load("ViT-B/32", device="cpu", jit=False)
+        _load_encoder_checkpoint(clip_model, checkpoint_path)
+        # CLIP's learned visual projection produces its documented 512-d embedding.
+        class VisualEncoder(nn.Module):
+            def __init__(self, visual):
+                super().__init__()
+                self.visual = visual
+                self.transformer = visual.transformer
+                self.ln_post = visual.ln_post
+            def forward(self, images):
+                return self.visual(images)
+        visual = VisualEncoder(clip_model.visual)
+        super().__init__(visual, 512, num_classes, projection_dim)
+        self.image_size = image_size
+
+
+class BioMedCLIPClassifier(FoundationClassifier):
+    """BiomedCLIP ViT-B/16 image encoder; requires open_clip_torch."""
+    MODEL_ID = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+
+    def __init__(self, num_classes: int = 39, projection_dim: int = 128,
+                 checkpoint_path: str | None = None, pretrained: bool = True):
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError("BiomedCLIP requires open_clip_torch (pip install open_clip_torch)") from exc
+        if pretrained:
+            model, _, _ = open_clip.create_model_and_transforms(self.MODEL_ID)
+        else:
+            model = open_clip.create_model("ViT-B-16", pretrained=None)
+        if checkpoint_path:
+            _load_encoder_checkpoint(model, checkpoint_path)
+        # encode_image returns the official shared CLIP embedding (512 dimensions).
+        class ImageEncoder(nn.Module):
+            def __init__(self, clip_model):
+                super().__init__()
+                self.clip_model = clip_model
+                self.visual = clip_model.visual
+                self.transformer = getattr(self.visual, "transformer", None)
+            def forward(self, images):
+                return self.clip_model.encode_image(images)
+        super().__init__(ImageEncoder(model), 512, num_classes, projection_dim)
+        self.image_size = 224
+
+
+class RETFoundDINO(FoundationClassifier):
+    """RETFound-DINOv2 (ViT-L/14, 1024 features) using the shared model API."""
+
     def __init__(
         self,
         model_name: str = "vit_large_patch14_dinov2",
         num_classes: int = 39,
         projection_dim: int = 128,
-        checkpoint_path: str = "weights/RETFound_dinov2_shanghai.pth",
+        checkpoint_path: str | None = "weights/RETFound_dinov2_shanghai.pth",
         image_size: int = 518,
     ) -> None:
-        """
-        RETFound DINOv2 wrapper.
-
-        Args:
-            model_name:      timm architecture string.  Must be ViT-L/14 for the
-                             RETFound_DINOv2 checkpoint (patch size 14, not 16).
-            num_classes:     Number of output classes for the classifier head.
-            projection_dim:  Output dimension of the projection head (128 per spec).
-            checkpoint_path: Path to the pretrained .pth file.
-            image_size:      Input image size (square).
-        """
-        super().__init__()
-
-        print("Initialising backbone: %s" % (model_name,))
-        self.image_size = image_size
-        self.backbone = timm.create_model(
+        encoder = timm.create_model(
             model_name,
             pretrained=False,
             num_classes=0,
             img_size=image_size,
         )
-        self.embed_dim: int = self.backbone.num_features
-        self.num_classes = num_classes
-
-
-        self.classification_head = nn.Linear(self.embed_dim, num_classes)
-
-        self.projection_head = nn.Sequential(
-            nn.Linear(self.embed_dim, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, projection_dim),
-        )
-
         if checkpoint_path:
-            self._load_backbone_checkpoint(checkpoint_path)
+            self._load_ret_found_checkpoint(encoder, checkpoint_path)
+        super().__init__(encoder, int(encoder.num_features), num_classes, projection_dim)
+        self.image_size = image_size
 
-        self.temperature = nn.Parameter(torch.ones(1), requires_grad=False)
-
-
-    def _load_backbone_checkpoint(self, checkpoint_path: str) -> None:
-        """
-        Load backbone weights from a DINOv2 teacher-student checkpoint.
-
-        Key lookup order:
-          1. "teacher"    — standard DINOv2 teacher-student format
-          2. "model"      — generic timm/RETFound wrapper
-          3. "state_dict" — generic PyTorch Lightning / HF wrapper
-          4. bare dict    — raw state dict (fails loudly if coverage is low)
-
-        Raises
-        ------
-        FileNotFoundError
-            If checkpoint_path does not exist on disk.
-        RuntimeError
-            If loaded backbone weight coverage is below _MIN_COVERAGE_RATIO,
-            which almost always means the wrong file was supplied.
-        """
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(
-                f"Checkpoint not found: {checkpoint_path}"
-            )
-
-        print("Loading checkpoint: %s" % (checkpoint_path,))
-        raw = torch.load(checkpoint_path, map_location="cpu")
-
-        if isinstance(raw, dict):
-            top_keys = list(raw.keys())
-            print("Checkpoint top-level keys: %s" % (top_keys,))
-
-            if "teacher" in raw:
-                state_dict = raw["teacher"]
-                print("Using 'teacher' sub-dict from checkpoint.")
-            elif "model" in raw:
-                state_dict = raw["model"]
-                print("Using 'model' sub-dict from checkpoint.")
-            elif "state_dict" in raw:
-                state_dict = raw["state_dict"]
-                print("Using 'state_dict' sub-dict from checkpoint.")
-            else:
-                print("WARNING: No known wrapper key found in checkpoint. Treating entire dict as state dict. Top-level keys: %s" % (top_keys,))
-                state_dict = raw
-        else:
-            raise RuntimeError(
-                f"Checkpoint at {checkpoint_path} is not a dict "
-                f"(got {type(raw).__name__}). Cannot load weights."
-            )
-
-
-        cleaned: dict[str, torch.Tensor] = {}
-        for k, v in state_dict.items():
-            k = k.replace("module.", "")
-            k = k.replace("backbone.", "")
-            cleaned[k] = v
-
-        backbone_dict = self.backbone.state_dict()
-        matched = {
-            k: v
-            for k, v in cleaned.items()
-            if k in backbone_dict and v.shape == backbone_dict[k].shape
-        }
-        coverage = len(matched) / max(len(backbone_dict), 1)
-
-        print("Backbone weight coverage: %d / %d keys (%.1f%%)" % (len(matched), len(backbone_dict), coverage * 100))
-
+    @staticmethod
+    def _load_ret_found_checkpoint(encoder: nn.Module, checkpoint_path: str) -> None:
+        """Load RETFound's teacher/model/state_dict or raw checkpoint format."""
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"Checkpoint at {checkpoint_path} is not a state dict")
+        state = next(
+            (raw[key] for key in ("teacher", "model", "state_dict") if isinstance(raw.get(key), dict)),
+            raw,
+        )
+        target = encoder.state_dict()
+        matched = {}
+        for key, value in state.items():
+            if not torch.is_tensor(value):
+                continue
+            candidates = [key]
+            current = key
+            for _ in range(4):
+                for prefix in ("module.", "backbone.", "model.", "encoder."):
+                    if current.startswith(prefix):
+                        current = current[len(prefix):]
+                        candidates.append(current)
+            for candidate in candidates:
+                if candidate in target and value.shape == target[candidate].shape:
+                    matched[candidate] = value
+                    break
+        coverage = len(matched) / max(len(target), 1)
         if coverage < _MIN_COVERAGE_RATIO:
             raise RuntimeError(
-                f"Backbone weight coverage is only {coverage:.1%} "
-                f"({len(matched)}/{len(backbone_dict)} keys matched). "
-                "This almost certainly means the wrong checkpoint file was "
-                "supplied. Check that the path in your config points to the "
-                "RETFound_DINOv2 checkpoint, not a different model. "
-                f"Checkpoint top-level keys were: {list(raw.keys()) if isinstance(raw, dict) else 'N/A'}"
+                f"RETFound-DINO checkpoint coverage is only {coverage:.1%} "
+                f"({len(matched)}/{len(target)} encoder keys matched). "
+                "Check that this is a compatible RETFound-DINOv2 checkpoint."
             )
-
-        missing, unexpected = self.backbone.load_state_dict(matched, strict=False)
-        print("Backbone weights loaded successfully.")
-        if missing:
-            print("Missing keys (not in checkpoint): %d" % (len(missing),))
-        if unexpected:
-            print("Unexpected keys (not in backbone): %d" % (len(unexpected),))
-
-
-    def unfreeze_last_n_blocks(self, num_layers: int) -> None:
-        """
-        Freeze the entire network, then selectively unfreeze:
-          - The classifier head
-          - The projection head
-          - The last `num_layers` transformer blocks of the backbone
-          - The backbone's final norm layer   ← required by spec §4
-
-        Args:
-            num_layers: Number of trailing transformer blocks to unfreeze.
-        """
-        for param in self.parameters():
-            param.requires_grad = False
-
-        for param in self.classification_head.parameters():
-            param.requires_grad = True
-        for param in self.projection_head.parameters():
-            param.requires_grad = True
-
-        if not hasattr(self.backbone, "blocks"):
-            print("WARNING: Backbone has no 'blocks' attribute — cannot selectively unfreeze transformer blocks.")
-            return
-
-        total_blocks = len(self.backbone.blocks)
-        n = min(max(0, num_layers), total_blocks)
-        start_idx = total_blocks - n
-
-        print("Unfreezing last %d / %d backbone blocks (indices %d–%d) + classification head + projection head + final norm." % (n, total_blocks, start_idx, total_blocks - 1))
-
-        for i in range(start_idx, total_blocks):
-            for param in self.backbone.blocks[i].parameters():
-                param.requires_grad = True
-
-        if hasattr(self.backbone, "norm"):
-            for param in self.backbone.norm.parameters():
-                param.requires_grad = True
-            print("Final backbone norm layer unfrozen.")
-        else:
-            print("WARNING: backbone.norm not found — final norm layer not unfrozen.")
-
-    def count_parameters(self) -> dict[str, float]:
-        """Return trainable / total parameter counts (in millions) per component."""
-        def _count(module: nn.Module) -> tuple[int, int]:
-            total = sum(p.numel() for p in module.parameters())
-            trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-            return total, trainable
-
-        bb_total, bb_train = _count(self.backbone)
-        cls_total, _ = _count(self.classification_head)
-        proj_total, _ = _count(self.projection_head)
-        all_total, all_train = _count(self)
-
-        stats = {
-            "backbone_total_M": bb_total / 1e6,
-            "backbone_trainable_M": bb_train / 1e6,
-            "classification_head_total_M": cls_total / 1e6,
-            "projection_head_total_M": proj_total / 1e6,
-            "model_total_M": all_total / 1e6,
-            "model_trainable_M": all_train / 1e6,
-        }
-
-        print("Parameters — backbone: %.2fM total / %.2fM trainable | cls head: %.2fM | proj head: %.2fM | model total: %.2fM / trainable: %.2fM" % (
-            stats["backbone_total_M"], stats["backbone_trainable_M"], stats["classification_head_total_M"], stats["projection_head_total_M"], stats["model_total_M"], stats["model_trainable_M"],
-        ))
-        return stats
-
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mode: str = "classification",
-        use_temperature: bool = True,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x:               Image tensor [B, C, H, W].
-            mode:             One of "classification", "projection", "features", "both".
-            use_temperature:  If True (default), classification logits are
-                              divided by self.temperature before being
-                              returned. No-op while temperature == 1.0 (i.e.
-                              before tune_temperature() has been run), so this
-                              does not change training dynamics.
-
-        Returns:
-            "classification" → logits [B, num_classes]
-            "projection"     → L2-normalised projection [B, projection_dim]
-            "features"       → raw backbone features [B, embed_dim]
-            "both"           → (logits, L2-normalised projection)
-        """
-        features = self.backbone(x)
-
-        if mode == "classification":
-            logits = self.classification_head(features)
-            if use_temperature:
-                logits = logits / self.temperature
-            return logits
-
-        if mode == "projection":
-            proj = self.projection_head(features)
-            return F.normalize(proj, dim=1)
-
-        if mode == "features":
-            return features
-
-        if mode == "both":
-            logits = self.classification_head(features)
-            if use_temperature:
-                logits = logits / self.temperature
-            proj = F.normalize(self.projection_head(features), dim=1)
-            return logits, proj
-
-        raise ValueError(
-            f"Invalid mode '{mode}'. "
-            "Choose 'classification', 'projection', 'features', or 'both'."
-        )
+        encoder.load_state_dict(matched, strict=False)

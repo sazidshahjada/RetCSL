@@ -8,12 +8,24 @@ from .dataset import (
     build_unlabeled_loader,
 )
 from .evaluation import ModelEvaluator
-from .foundation import RETFoundDINO
+from .foundation import (
+    BioMedCLIPClassifier,
+    DINOv2Classifier,
+    EyeCLIPClassifier,
+    FoundationClassifier,
+    RETFoundDINO,
+    RETFoundMAE,
+)
 from .losses import ClassBalancedFocalLoss, CombinedLoss, SupConLoss
 from .trainer import FoundationModelTrainer
 
 __all__ = [
     "RETFoundDINO",
+    "RETFoundMAE",
+    "DINOv2Classifier",
+    "EyeCLIPClassifier",
+    "BioMedCLIPClassifier",
+    "FoundationClassifier",
     "ClassBalancedFocalLoss",
     "CombinedLoss",
     "SupConLoss",
